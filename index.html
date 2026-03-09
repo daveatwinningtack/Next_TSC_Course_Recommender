@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TSC Fixed-Marks Course Generator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 16px;
+      line-height: 1.4;
+    }
+    h1 { margin-bottom: 6px; }
+    .caption { color: #555; margin-bottom: 18px; }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    input, select, button {
+      width: 100%;
+      padding: 8px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    button {
+      width: auto;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    .section {
+      margin-top: 24px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 10px;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f5f5f5; }
+    .result-box {
+      background: #f8fafc;
+      border: 1px solid #dbe2ea;
+      padding: 14px;
+      border-radius: 8px;
+      margin-top: 12px;
+    }
+    .small { color: #666; font-size: 13px; }
+    .checkbox-row {
+      margin: 8px 0 16px;
+    }
+    details { margin-top: 18px; }
+    @media (max-width: 800px) {
+      .controls { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 520px) {
+      .controls { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>TSC Fixed-Marks Course Generator</h1>
+  <div class="caption">
+    Inputs: wind direction (from) + wind speed. Output: recommended course under 3.0 hours, with a 2.0–2.5 hour target.
+  </div>
+
+  <div class="controls">
+    <div>
+      <label for="windDir">Wind direction (compass)</label>
+      <select id="windDir"></select>
+    </div>
+    <div>
+      <label for="windDeg">Wind direction (degrees)</label>
+      <input id="windDeg" type="number" min="0" max="359.9" step="1" value="200" />
+    </div>
+    <div>
+      <label for="windSpeed">Wind speed (kt)</label>
+      <input id="windSpeed" type="number" min="0" max="60" step="0.5" value="15" />
+    </div>
+    <div>
+      <label for="topN">Show top N courses</label>
+      <input id="topN" type="number" min="1" max="15" step="1" value="5" />
+    </div>
+  </div>
+
+  <div class="small" id="windSummary"></div>
+
+  <div class="checkbox-row">
+    <label><input type="checkbox" id="showLegs" /> Show expanded legs (details)</label>
+  </div>
+
+  <button id="generateBtn">Generate course</button>
+
+  <div id="output"></div>
+
+  <details class="section">
+    <summary><strong>Mark Names and Aliases</strong></summary>
+    <div id="marksTable"></div>
+  </details>
+
+  <script>
+    const MARKS = {
+      "BB":   [33 + 51.700/60.0, -(96 + 38.630/60.0)],
+      "TSC1": [33 + 52.070/60.0, -(96 + 37.900/60.0)],
+      "TSC3": [33 + 53.790/60.0, -(96 + 37.780/60.0)],
+      "PNJ":  [33 + 51.700/60.0, -(96 + 35.940/60.0)],
+      "WE":   [33 + 49.300/60.0, -(96 + 36.000/60.0)],
+      "WT":   [33 + 54.723/60.0, -(96 + 35.790/60.0)],
+      "CC":   [33 + 55.410/60.0, -(96 + 42.790/60.0)],
+      "TT":   [33 + 51.790/60.0, -(96 + 39.190/60.0)]
+    };
+
+    const EARTH_RADIUS_NM = 3440.065;
+
+    const COMPASS_TO_DEG = {
+      "N": 0.0, "NNE": 22.5, "NE": 45.0, "ENE": 67.5,
+      "E": 90.0, "ESE": 112.5, "SE": 135.0, "SSE": 157.5,
+      "S": 180.0, "SSW": 202.5, "SW": 225.0, "WSW": 247.5,
+      "W": 270.0, "WNW": 292.5, "NW": 315.0, "NNW": 337.5
+    };
+
+    const MARK_ALIAS_DATA = [
+      { short: "BB", long: "Bill’s Buoy", aliases: "N, Start, Finish" },
+      { short: "PNJ", long: "Pete and Judy", aliases: "D" },
+      { short: "WT", long: "WinningTack", aliases: "WF" },
+      { short: "WE", long: "Witt's End", aliases: "IF" },
+      { short: "CC", long: "Carmen's Corner", aliases: "H" },
+      { short: "TT", long: "Tom's Turnaround", aliases: "A" },
+      { short: "TSC1", long: "TSC 1 Waypoint", aliases: "TSC1" },
+      { short: "TSC3", long: "TSC 3 Waypoint", aliases: "TSC3" }
+    ];
+
+    function makeEdge(name, start, end, path) {
+      return { name, start, end, path };
+    }
+
+    function expandedLegs(edge) {
+      const legs = [];
+      for (let i = 0; i < edge.path.length - 1; i++) {
+        legs.push([edge.path[i], edge.path[i+1]]);
+      }
+      return legs;
+    }
+
+    function isCorridor(edge) {
+      return edge.path.length > 2;
+    }
+
+    const CORRIDORS = [
+      makeEdge("CC->BB corridor", "CC", "BB", ["CC","TSC3","TSC1","BB"]),
+      makeEdge("BB->CC corridor", "BB", "CC", ["BB","TSC1","TSC3","CC"]),
+
+      makeEdge("PNJ->CC corridor", "PNJ", "CC", ["PNJ","TSC3","CC"]),
+      makeEdge("CC->PNJ corridor", "CC", "PNJ", ["CC","TSC3","PNJ"]),
+
+      makeEdge("PNJ->BB corridor", "PNJ", "BB", ["PNJ","TSC1","BB"]),
+      makeEdge("BB->PNJ corridor", "BB", "PNJ", ["BB","TSC1","PNJ"]),
+
+      makeEdge("WT->BB corridor", "WT", "BB", ["WT","TSC1","BB"]),
+      makeEdge("BB->WT corridor", "BB", "WT", ["BB","TSC1","WT"]),
+
+      makeEdge("WE->BB corridor", "WE", "BB", ["WE","TSC1","BB"]),
+      makeEdge("BB->WE corridor", "BB", "WE", ["BB","TSC1","WE"]),
+
+      makeEdge("CC->WE corridor", "CC", "WE", ["CC","TSC3","WE"]),
+      makeEdge("WE->CC corridor", "WE", "CC", ["WE","TSC3","CC"]),
+
+      makeEdge("TT->PNJ corridor", "TT", "PNJ", ["TT","TSC1","PNJ"]),
+      makeEdge("PNJ->TT corridor", "PNJ", "TT", ["PNJ","TSC1","TT"])
+    ];
+
+    const SIMPLE_EDGES = [
+      makeEdge("WE->PNJ", "WE", "PNJ", ["WE","PNJ"]),
+      makeEdge("PNJ->WE", "PNJ", "WE", ["PNJ","WE"]),
+      makeEdge("PNJ->WT", "PNJ", "WT", ["PNJ","WT"]),
+      makeEdge("WT->PNJ", "WT", "PNJ", ["WT","PNJ"]),
+      makeEdge("WE->WT", "WE", "WT", ["WE","WT"]),
+      makeEdge("WT->WE", "WT", "WE", ["WT","WE"]),
+      makeEdge("WT->CC", "WT", "CC", ["WT","CC"]),
+      makeEdge("CC->WT", "CC", "WT", ["CC","WT"]),
+      makeEdge("TT->BB", "TT", "BB", ["TT","BB"]),
+      makeEdge("BB->TT", "BB", "TT", ["BB","TT"])
+    ];
+
+    const ALL_EDGES = [...SIMPLE_EDGES, ...CORRIDORS];
+    const ADJ = {};
+    for (const e of ALL_EDGES) {
+      if (!ADJ[e.start]) ADJ[e.start] = [];
+      ADJ[e.start].push(e);
+    }
+
+    function radians(deg) { return deg * Math.PI / 180.0; }
+    function degrees(rad) { return rad * 180.0 / Math.PI; }
+
+    function haversineNm(a, b) {
+      const [lat1, lon1] = MARKS[a];
+      const [lat2, lon2] = MARKS[b];
+      const phi1 = radians(lat1), lam1 = radians(lon1);
+      const phi2 = radians(lat2), lam2 = radians(lon2);
+      const dphi = phi2 - phi1;
+      const dlam = lam2 - lam1;
+      const h = Math.sin(dphi/2)**2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlam/2)**2;
+      return 2 * EARTH_RADIUS_NM * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+    }
+
+    function initialBearingDeg(a, b) {
+      const [lat1, lon1] = MARKS[a];
+      const [lat2, lon2] = MARKS[b];
+      const phi1 = radians(lat1), lam1 = radians(lon1);
+      const phi2 = radians(lat2), lam2 = radians(lon2);
+      const dlam = lam2 - lam1;
+      const x = Math.sin(dlam) * Math.cos(phi2);
+      const y = Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dlam);
+      return (degrees(Math.atan2(x, y)) + 360.0) % 360.0;
+    }
+
+    function smallestAngleDeg(x) {
+      x = (x + 180.0) % 360.0 - 180.0;
+      return Math.abs(x);
+    }
+
+    function planningVmgKnots(windSpeedKt) {
+      if (windSpeedKt < 5.0) return 2.7;
+      if (windSpeedKt < 8.0) return 3.3;
+      return 4.3;
+    }
+
+    function legTypeAndSpeed(bearingDeg, windFromDeg, windSpeedKt) {
+      const vmg = planningVmgKnots(windSpeedKt);
+      const windTo = (windFromDeg + 180.0) % 360.0;
+      const twa = smallestAngleDeg(bearingDeg - windTo);
+
+      if (twa > 120.0) return ["UPWIND-ish", Math.max(1.0, vmg * 0.8)];
+      if (twa < 60.0) return ["DOWNWIND-ish", Math.max(1.0, vmg * 0.90)];
+      return ["REACH", Math.max(1.0, vmg * 1.25)];
+    }
+
+    function edgeTime(edge, windFromDeg, windSpeedKt) {
+      let totalDist = 0.0;
+      let totalTime = 0.0;
+      const details = [];
+
+      for (const [a, b] of expandedLegs(edge)) {
+        const dist = haversineNm(a, b);
+        const brg = initialBearingDeg(a, b);
+        const [ltype, spd] = legTypeAndSpeed(brg, windFromDeg, windSpeedKt);
+        const t = dist / spd;
+        totalDist += dist;
+        totalTime += t;
+        details.push({ a, b, dist, brg, ltype, spd, t });
+      }
+
+      return { totalDist, totalTime, details };
+    }
+
+    function edgeScore(edge, windFromDeg, windSpeedKt, prevEdge) {
+      const { totalDist, totalTime, details } = edgeTime(edge, windFromDeg, windSpeedKt);
+      let score = 0.0;
+
+      for (const leg of details) {
+        const d = leg.dist;
+        const ltype = leg.ltype;
+        if (windSpeedKt >= 8.0) {
+          if (ltype.includes("UPWIND") || ltype.includes("DOWNWIND")) score += 2.0 * d;
+          else score -= 1.2 * d;
+        } else {
+          if (ltype === "REACH") score += 2.0 * d;
+          else if (ltype.includes("DOWNWIND")) score += 0.6 * d;
+          else score -= 1.2 * d;
+        }
+      }
+
+      if (totalDist < 0.6) score -= 3.0;
+
+      if (prevEdge) {
+        if (prevEdge.start === edge.end && prevEdge.end === edge.start) score -= 6.0;
+        if (prevEdge.end === edge.end) score -= 2.0;
+      }
+
+      if (isCorridor(edge)) score -= 0.8;
+      if (totalTime > 1.2) score -= (totalTime - 1.2) * 2.0;
+
+      return score;
+    }
+
+    function recommendCourses(windFromDeg, windSpeedKt, hardCapHr = 3.0, targetWindow = [2.0, 2.5], minEdges = 2, maxEdges = 7, topK = 10) {
+      let best = [];
+
+      function consider(c) {
+        best.push(c);
+        best.sort((a, b) => b.score - a.score);
+        best = best.slice(0, topK);
+      }
+
+      function dfs(current, edges, tHr, dNm, score) {
+        if (tHr > hardCapHr || edges.length > maxEdges) return;
+
+        if (current === "BB" && edges.length >= minEdges) {
+          const [lo, hi] = targetWindow;
+          const center = (lo + hi) / 2.0;
+          const bonus = (lo <= tHr && tHr <= hi) ? 10.0 : -Math.abs(tHr - center) * 6.0;
+          consider({ edges: [...edges], totalTime: tHr, totalDist: dNm, score: score + bonus });
+        }
+
+        const prev = edges.length ? edges[edges.length - 1] : null;
+        for (const e of (ADJ[current] || [])) {
+          if (edges.length < 2 && e.end === "BB") continue;
+          const et = edgeTime(e, windFromDeg, windSpeedKt);
+          const escore = edgeScore(e, windFromDeg, windSpeedKt, prev);
+          dfs(e.end, [...edges, e], tHr + et.totalTime, dNm + et.totalDist, score + escore);
+        }
+      }
+
+      dfs("BB", [], 0.0, 0.0, 0.0);
+      return best;
+    }
+
+    function nodesMacro(edges, start = "BB") {
+      const out = [start];
+      for (const e of edges) out.push(e.end);
+      return out;
+    }
+
+    function nodesExpanded(edges, start = "BB") {
+      const out = [start];
+      for (const e of edges) {
+        for (let i = 1; i < e.path.length; i++) out.push(e.path[i]);
+      }
+      return out;
+    }
+
+    function normalizeDeg(d) {
+      return ((Number(d) % 360) + 360) % 360;
+    }
+
+    function nearestCompassPoint(deg) {
+      deg = normalizeDeg(deg);
+      let bestKey = "N";
+      let bestDiff = Infinity;
+
+      for (const [k, v] of Object.entries(COMPASS_TO_DEG)) {
+        let diff = Math.abs(v - deg);
+        if (diff > 180) diff = 360 - diff;
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestKey = k;
+        }
+      }
+      return bestKey;
+    }
+
+    function buildMarksTable() {
+      const div = document.getElementById("marksTable");
+      let html = `
+        <table>
+          <thead>
+            <tr>
+              <th>Mark Name (Short)</th>
+              <th>Mark Name (Long)</th>
+              <th>Aliases</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+      for (const row of MARK_ALIAS_DATA) {
+        html += `
+          <tr>
+            <td>${row.short}</td>
+            <td>${row.long}</td>
+            <td>${row.aliases}</td>
+          </tr>
+        `;
+      }
+      html += `</tbody></table>`;
+      div.innerHTML = html;
+    }
+
+    function buildLegsTable(best, windFrom, windSpeed) {
+      let rows = "";
+      for (const e of best.edges) {
+        const et = edgeTime(e, windFrom, windSpeed);
+        for (const leg of et.details) {
+          rows += `
+            <tr>
+              <td>${e.name}</td>
+              <td>${leg.a}</td>
+              <td>${leg.b}</td>
+              <td>${leg.dist.toFixed(2)}</td>
+              <td>${leg.brg.toFixed(1)}</td>
+              <td>${leg.ltype}</td>
+              <td>${leg.spd.toFixed(2)}</td>
+              <td>${leg.t.toFixed(2)}</td>
+            </tr>
+          `;
+        }
+      }
+
+      return `
+        <div class="section">
+          <h3>Expanded legs (recommended)</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Edge</th>
+                <th>From</th>
+                <th>To</th>
+                <th>Dist (nm)</th>
+                <th>Bearing (deg)</th>
+                <th>Type</th>
+                <th>Speed (kt)</th>
+                <th>Time (hr)</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function generateCourse() {
+      const windFrom = normalizeDeg(parseFloat(document.getElementById("windDeg").value || "0"));
+      const windSpeed = parseFloat(document.getElementById("windSpeed").value || "0");
+      const topN = parseInt(document.getElementById("topN").value || "5", 10);
+      const showLegs = document.getElementById("showLegs").checked;
+      const output = document.getElementById("output");
+
+      const candidates = recommendCourses(windFrom, windSpeed, 3.0, [2.0, 2.5], 2, 7, topN);
+
+      if (!candidates.length) {
+        output.innerHTML = `<div class="result-box">No valid courses found under constraints.</div>`;
+        return;
+      }
+
+      const best = candidates[0];
+      const macro = nodesMacro(best.edges).join("–");
+      const expanded = nodesExpanded(best.edges).join("–");
+
+      let html = `
+        <div class="section">
+          <h2>Recommended</h2>
+          <div class="result-box">
+            <div><strong>Course (macro):</strong> ${macro}</div>
+            ${expanded !== macro ? `<div><strong>Course (expanded):</strong> ${expanded}</div>` : ""}
+            <div><strong>Estimated time:</strong> ${best.totalTime.toFixed(2)} hr &nbsp; | &nbsp; <strong>Estimated distance:</strong> ${best.totalDist.toFixed(2)} nm</div>
+          </div>
+        </div>
+      `;
+
+      if (candidates.length > 1) {
+        let rows = "";
+        for (const c of candidates.slice(1, topN)) {
+          rows += `
+            <tr>
+              <td>${nodesMacro(c.edges).join("–")}</td>
+              <td>${nodesExpanded(c.edges).join("–")}</td>
+              <td>${c.totalTime.toFixed(2)}</td>
+              <td>${c.totalDist.toFixed(2)}</td>
+            </tr>
+          `;
+        }
+
+        html += `
+          <div class="section">
+            <h2>Alternates</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Macro course</th>
+                  <th>Expanded</th>
+                  <th>Est time (hr)</th>
+                  <th>Est dist (nm)</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      if (showLegs) {
+        html += buildLegsTable(best, windFrom, windSpeed);
+      }
+
+      output.innerHTML = html;
+    }
+
+    function syncFromCompass() {
+      const dir = document.getElementById("windDir").value;
+      document.getElementById("windDeg").value = COMPASS_TO_DEG[dir].toFixed(1);
+      updateWindSummary();
+    }
+
+    function syncFromDegrees() {
+      const degInput = document.getElementById("windDeg");
+      const deg = normalizeDeg(parseFloat(degInput.value || "0"));
+      degInput.value = deg.toFixed(1);
+      document.getElementById("windDir").value = nearestCompassPoint(deg);
+      updateWindSummary();
+    }
+
+    function updateWindSummary() {
+      const deg = normalizeDeg(parseFloat(document.getElementById("windDeg").value || "0"));
+      document.getElementById("windSummary").innerHTML =
+        `Using wind direction: <strong>${deg.toFixed(1)}°</strong> (${nearestCompassPoint(deg)})`;
+    }
+
+    function initCompass() {
+      const sel = document.getElementById("windDir");
+      for (const key of Object.keys(COMPASS_TO_DEG)) {
+        const opt = document.createElement("option");
+        opt.value = key;
+        opt.textContent = key;
+        sel.appendChild(opt);
+      }
+      sel.value = nearestCompassPoint(200);
+    }
+
+    initCompass();
+    buildMarksTable();
+    syncFromDegrees();
+
+    document.getElementById("windDir").addEventListener("change", syncFromCompass);
+    document.getElementById("windDeg").addEventListener("change", syncFromDegrees);
+    document.getElementById("generateBtn").addEventListener("click", generateCourse);
+  </script>
+</body>
+</html>
